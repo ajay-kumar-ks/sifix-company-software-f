@@ -8,6 +8,7 @@ import {
   FaUser,
   FaUsers,
   FaLock,
+  FaHistory,
 } from 'react-icons/fa'
 
 export default function Sidebar() {
@@ -34,7 +35,7 @@ export default function Sidebar() {
   const menuItems = [
     { path: isEmployee ? '/employee/dashboard' : '/dashboard', icon: FaThLarge, label: 'Dashboard' },
     { path: isEmployee ? '/employee/crm' : '/crm', icon: FaAddressBook, label: 'CRM' },
-    ...(isEmployee ? [] : [{ path: '/hr', icon: FaUsers, label: 'HR' }]),
+    ...(isEmployee ? [] : [{ path: '/hr', icon: FaUsers, label: 'HR' }, { path: '/audit-log', icon: FaHistory, label: 'Activity Log' }]),
   ]
 
   function handleLogout() {

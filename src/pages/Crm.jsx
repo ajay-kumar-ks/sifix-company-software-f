@@ -1,12 +1,22 @@
-import React, { useEffect, useRef, useState, useMemo, useReducer } from 'react'
+import React, { useEffect, useRef, useState, useMemo, useReducer, useCallback } from 'react'
 import Sidebar from '../components/Sidebar'
 import ThemeToggle from '../components/ThemeToggle'
 import Loader from '../components/Loader'
 import NotificationContainer, { notificationReducer, createNotification } from '../components/NotificationContainer'
 import PipelineManager from '../components/PipelineManager'
-import { FaSearch, FaPlus, FaArrowRight, FaChevronDown, FaCog } from 'react-icons/fa'
+import { Link, useNavigate } from 'react-router-dom'
+import { FaSearch, FaPlus, FaArrowRight, FaChevronDown, FaCog, FaUsers } from 'react-icons/fa'
 
-const crmTabs = ['Contacts', 'Leads', 'Clients']
+function formatDate(dateStr) {
+  if (!dateStr) return '—'
+  const d = new Date(dateStr + 'Z')
+  const day = String(d.getDate()).padStart(2, '0')
+  const month = String(d.getMonth() + 1).padStart(2, '0')
+  const year = d.getFullYear()
+  return `${day}/${month}/${year}`
+}
+
+const crmTabs = ['Contacts', 'Leads', 'Clients', 'Deleted']
 const REQUEST_TIMEOUT_MS = 8000
 
 const defaultLeadPhases = [
@@ -36,6 +46,10 @@ export default function Crm() {
   })
   const [loading, setLoading] = useState(false)
   const [contactsLoading, setContactsLoading] = useState(false)
+
+  // NOTE: `loading` was previously unused for contacts table; keep it only if used elsewhere.
+  // For Contacts table we rely on `contactsLoading`.
+
   const [contactsLoaded, setContactsLoaded] = useState(false)
   const [pipelineRefreshing, setPipelineRefreshing] = useState(false)
   const [pipelinesLoaded, setPipelinesLoaded] = useState(false)
@@ -71,6 +85,54 @@ export default function Crm() {
     status: '',
   })
   const [leadDetailSubmitting, setLeadDetailSubmitting] = useState(false)
+  // Admin user filter state
+  const role = localStorage.getItem('user_role')
+  const isAdmin = role === 'admin'
+  const [users, setUsers] = useState([])
+  const [selectedOwner, setSelectedOwner] = useState('admin')
+  const [userFilterLoading, setUserFilterLoading] = useState(false)
+  const [isRefSearchModalOpen, setIsRefSearchModalOpen] = useState(false)
+  const [refSearchValue, setRefSearchValue] = useState('')
+  const [refSearchError, setRefSearchError] = useState('')
+  const [refSearching, setRefSearching] = useState(false)
+  const navigate = useNavigate()
+  const [deletingContactId, setDeletingContactId] = useState(null)
+  const [restoringContactId, setRestoringContactId] = useState(null)
+  const [assigningLeadId, setAssigningLeadId] = useState(null)
+  const [assigningPipelineId, setAssigningPipelineId] = useState({})
+
+  useEffect(() => {
+    if (!isAdmin) return
+    const token = localStorage.getItem('token')
+    fetch(`${import.meta.env.VITE_API_URL}/users`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => {
+        setUsers(Array.isArray(data) ? data : [])
+      })
+      .catch(() => {})
+  }, [])
+
+  const loadCrmData = useCallback(async () => {
+    setUserFilterLoading(true)
+    setContactsLoading(true)
+    setPipelineRefreshing(true)
+    try {
+      await Promise.all([fetchPipelines(true), fetchContacts(activeTab === 'Deleted')])
+    } catch (err) {
+      console.error('Failed to load CRM data', err)
+    } finally {
+      setUserFilterLoading(false)
+      setContactsLoading(false)
+      setPipelineRefreshing(false)
+    }
+  }, [isAdmin, selectedOwner, activeTab])
+
+  useEffect(() => {
+    loadCrmData()
+  }, [loadCrmData])
+
   const pipelineMenuRef = useRef(null)
   const [notifications, dispatchNotifications] = useReducer(notificationReducer, [])
 
@@ -84,10 +146,6 @@ export default function Crm() {
       window.clearTimeout(timeoutId)
     }
   }
-
-  useEffect(() => {
-    Promise.allSettled([fetchPipelines(true), fetchContacts()])
-  }, [])
 
   useEffect(() => {
     function handleClickOutside(event) {
@@ -122,7 +180,13 @@ export default function Crm() {
     setBoardReady(false)
     try {
       const token = localStorage.getItem('token')
-      const res = await fetchWithTimeout(`${import.meta.env.VITE_API_URL}/pipelines`, {
+      let url = `${import.meta.env.VITE_API_URL}/pipelines`
+      if (isAdmin && selectedOwner === 'admin') {
+        url += `?owner=${encodeURIComponent('admin')}`
+      } else if (isAdmin && selectedOwner && selectedOwner !== 'admin') {
+        url += `?owner=${encodeURIComponent(selectedOwner)}`
+      }
+      const res = await fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!res.ok) throw new Error('Failed to load pipelines')
@@ -157,13 +221,24 @@ export default function Crm() {
     }
   }
 
-  async function fetchContacts() {
+  async function fetchContacts(includeDeleted = false) {
     setContactsLoading(true)
     setContactsLoaded(false)
     setError('')
     try {
       const token = localStorage.getItem('token')
-      const res = await fetchWithTimeout(`${import.meta.env.VITE_API_URL}/contacts`, {
+      let url = `${import.meta.env.VITE_API_URL}/contacts`
+      const params = []
+      if (includeDeleted) {
+        params.push('include_deleted=true')
+      }
+      if (isAdmin && selectedOwner === 'admin') {
+        params.push(`owner=${encodeURIComponent('admin')}`)
+      } else if (isAdmin && selectedOwner && selectedOwner !== 'admin') {
+        params.push(`owner=${encodeURIComponent(selectedOwner)}`)
+      }
+      if (params.length) url += '?' + params.join('&')
+      const res = await fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` },
       }, 12000)
       if (!res.ok) throw new Error('Failed to load contacts')
@@ -196,16 +271,21 @@ export default function Crm() {
 
   const displayedContacts = useMemo(
     () => filteredContacts.filter(contact => {
+      // Deleted tab: only show deleted contacts
+      if (activeTab === 'Deleted') {
+        return contact.is_deleted === true
+      }
+      // Other tabs: hide deleted contacts
+      if (contact.is_deleted) return false
+
       const contactsPipelineId = contact.pipeline_id
 
       if (activeTab === 'Contacts') {
-        // Show ALL contacts in the Contacts tab, regardless of pipeline status
+        // Show all active contacts
         return true
       }
 
-      const matchesPipeline = contactsPipelineId == null
-        ? Boolean(selectedPipelineId) && selectedPipelineId === defaultPipelineIdForLegacyLeads
-        : Boolean(selectedPipelineId) && contactsPipelineId === selectedPipelineId
+      const matchesPipeline = Boolean(selectedPipelineId) && contactsPipelineId === selectedPipelineId
 
       if (activeTab === 'Leads') {
         return matchesPipeline && (contact.stage === 'Lead' || contact.status === 'Contacted')
@@ -232,11 +312,14 @@ export default function Crm() {
     })
 
     if (isLeadModal) {
-      const pipeline = pipelines.find(p => p.id === selectedPipelineId) || pipelines[0]
+      const pipeline = pipelines.find(p => p.id === selectedPipelineId) || null
       if (pipeline) {
         setSelectedPipelineId(pipeline.id)
         const initialPhases = pipeline.phases?.length ? pipeline.phases : defaultLeadPhases
         setLeadPhases(initialPhases.map(phase => ({ ...phase, id: phase.id || `phase-${Date.now()}-${Math.random()}` })))
+      } else {
+        setSelectedPipelineId(null)
+        setLeadPhases(defaultLeadPhases.map(phase => ({ ...phase, id: phase.id || `phase-${Date.now()}-${Math.random()}` })))
       }
     }
   }
@@ -260,7 +343,7 @@ export default function Crm() {
       const token = localStorage.getItem('token')
       const payload = {
         ...formData,
-        ...(activeTab === 'Leads' ? { phases: leadPhases, pipeline_id: selectedPipelineId } : {}),
+        ...(activeTab === 'Leads' ? { phases: leadPhases, pipeline_id: selectedPipelineId || null } : {}),
       }
       const res = await fetch(`${import.meta.env.VITE_API_URL}/contacts`, {
         method: 'POST',
@@ -403,6 +486,42 @@ export default function Crm() {
     setLeadDetailSubmitting(false)
   }
 
+  function handleRefSearchClose() {
+    setIsRefSearchModalOpen(false)
+    setRefSearchValue('')
+    setRefSearchError('')
+    setRefSearching(false)
+  }
+
+  async function handleRefSearchSubmit(e) {
+    e.preventDefault()
+    if (!refSearchValue.trim()) {
+      setRefSearchError('Enter a reference number to search.')
+      return
+    }
+    setRefSearching(true)
+    setRefSearchError('')
+
+    try {
+      const token = localStorage.getItem('token')
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/contacts/reference/${encodeURIComponent(refSearchValue.trim())}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const errorJson = await res.json().catch(() => null)
+        setRefSearchError(errorJson?.detail || 'Contact not found')
+        return
+      }
+      const contact = await res.json()
+      handleRefSearchClose()
+      navigate(`/crm/contact/${contact.reference_id || contact.id}`)
+    } catch (err) {
+      setRefSearchError(err.message || 'Failed to search contact reference')
+    } finally {
+      setRefSearching(false)
+    }
+  }
+
   function handleLeadDetailInputChange(field, value) {
     setLeadDetailFormData(prev => ({ ...prev, [field]: value }))
   }
@@ -453,6 +572,93 @@ export default function Crm() {
       })
     } finally {
       setLeadDetailSubmitting(false)
+    }
+  }
+
+  async function handleDeleteContact(contactId) {
+    setDeletingContactId(contactId)
+    const token = localStorage.getItem('token')
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/contacts/${contactId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => null)
+        throw new Error(err?.detail || 'Failed to delete contact')
+      }
+      // Refresh contacts including deleted ones for the Deleted tab
+      await fetchContacts(true)
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('success', 'Deleted', 'Contact moved to deleted contacts.'),
+      })
+    } catch (err) {
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('error', 'Error', err.message || 'Failed to delete contact'),
+      })
+    } finally {
+      setDeletingContactId(null)
+    }
+  }
+
+  async function handleRestoreContact(contactId) {
+    setRestoringContactId(contactId)
+    const token = localStorage.getItem('token')
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/contacts/${contactId}/restore`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => null)
+        throw new Error(err?.detail || 'Failed to restore contact')
+      }
+      await fetchContacts(true)
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('success', 'Restored', 'Contact restored successfully.'),
+      })
+    } catch (err) {
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('error', 'Error', err.message || 'Failed to restore contact'),
+      })
+    } finally {
+      setRestoringContactId(null)
+    }
+  }
+
+  async function handleAssignToPipeline(contactId, pipelineId) {
+    setAssigningLeadId(contactId)
+    const token = localStorage.getItem('token')
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/contacts/${contactId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ pipeline_id: pipelineId }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => null)
+        throw new Error(err?.detail || 'Failed to assign lead')
+      }
+      const updated = await res.json()
+      setContacts(prev => prev.map(c => (c.id === updated.id ? updated : c)))
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('success', 'Assigned', 'Lead assigned to pipeline successfully.'),
+      })
+    } catch (err) {
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('error', 'Error', err.message || 'Failed to assign lead to pipeline'),
+      })
+    } finally {
+      setAssigningLeadId(null)
     }
   }
 
@@ -518,16 +724,31 @@ export default function Crm() {
 
   const leadContacts = useMemo(
     () => contacts.filter(contact => {
-      const matchesPipeline = contact.pipeline_id == null
-        ? Boolean(selectedPipelineId) && selectedPipelineId === defaultPipelineIdForLegacyLeads
-        : Boolean(selectedPipelineId) && contact.pipeline_id === selectedPipelineId
-
-      return matchesPipeline
+      return contact.pipeline_id != null && contact.pipeline_id === selectedPipelineId
     }),
-    [contacts, selectedPipelineId, defaultPipelineIdForLegacyLeads],
+    [contacts, selectedPipelineId],
   )
 
+  const unassignedLeads = useMemo(
+    () => contacts.filter(contact => {
+      return contact.pipeline_id == null && (contact.stage === 'Lead' || contact.status === 'Contacted')
+    }),
+    [contacts],
+  )
+
+  // Performance: avoid filtering `leadContacts` once per phase.
+  const leadsByPhaseIndex = useMemo(() => {
+    const map = {} // phaseIndex -> Contact[]
+    for (const contact of leadContacts) {
+      const idx = getLeadPhaseIndex(contact)
+      if (!map[idx]) map[idx] = []
+      map[idx].push(contact)
+    }
+    return map
+  }, [leadContacts, leadPhaseMap, kanbanPhases])
+
   const showLeadBoardLoader = activeTab === 'Leads' && (!boardReady || pipelineRefreshing)
+
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>
@@ -575,6 +796,58 @@ export default function Crm() {
               }}
             />
           </div>
+          {/* Admin user filter dropdown */}
+          {isAdmin && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '16px' }}>
+              <FaUsers style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }} />
+              <select
+                value={selectedOwner}
+                onChange={e => {
+                  setSelectedOwner(e.target.value)
+                  setSelectedPipelineId(null)
+                  setLeadPhases([])
+                }}
+                style={{
+                  padding: '8px 14px',
+                  borderRadius: '999px',
+                  border: '1px solid var(--border-color)',
+                  backgroundColor: 'var(--bg-secondary)',
+                  color: 'var(--text-primary)',
+                  fontSize: '0.85rem',
+                  cursor: 'pointer',
+                  outline: 'none',
+                  minWidth: '180px',
+                }}
+              >
+                <option value="">All contacts</option>
+                {users.map(u => (
+                  <option key={u.username} value={u.username}>
+                    {u.label || u.username}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setRefSearchError('')
+              setRefSearchValue('')
+              setIsRefSearchModalOpen(true)
+            }}
+            style={{
+              marginLeft: '16px',
+              padding: '8px 14px',
+              borderRadius: '999px',
+              border: '1px solid var(--border-color)',
+              backgroundColor: 'var(--bg-secondary)',
+              color: 'var(--text-primary)',
+              fontSize: '0.85rem',
+              cursor: 'pointer',
+            }}
+          >
+            Search ref
+          </button>
           <div style={{ marginLeft: 'auto' }}>
             <ThemeToggle />
           </div>
@@ -608,8 +881,98 @@ export default function Crm() {
             ))}
           </div>
         </div>
+        {isRefSearchModalOpen && (
+          <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(15, 23, 42, 0.6)', zIndex: 1200, display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '24px' }}>
+            <div style={{ width: '100%', maxWidth: '480px', backgroundColor: 'var(--bg-card)', borderRadius: '24px', padding: '24px', boxShadow: '0 24px 80px rgba(15,23,42,0.2)', border: '1px solid var(--border-color)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '18px' }}>
+                <div>
+                  <h3 style={{ fontSize: '1.25rem', fontWeight: 700, marginBottom: '4px' }}>Search by Reference</h3>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.95rem', margin: 0 }}>
+                    Enter the reference ID to find a contact and go to its track page.
+                  </p>
+                </div>
+                <button
+                  onClick={handleRefSearchClose}
+                  style={{ border: 'none', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '1.2rem', padding: '6px' }}
+                >
+                  ×
+                </button>
+              </div>
+              <form onSubmit={handleRefSearchSubmit} style={{ display: 'grid', gap: '14px' }}>
+                <label style={{ display: 'grid', gap: '8px', fontSize: '0.95rem', fontWeight: 600 }}>
+                  Reference ID
+                  <input
+                    value={refSearchValue}
+                    onChange={e => setRefSearchValue(e.target.value)}
+                    placeholder="e.g. 001000123"
+                    style={{
+                      width: '100%',
+                      padding: '12px 14px',
+                      borderRadius: '12px',
+                      border: '1px solid var(--border-color)',
+                      backgroundColor: 'var(--bg-secondary)',
+                      color: 'var(--text-primary)',
+                    }}
+                  />
+                </label>
+                {refSearchError && (
+                  <div style={{ color: '#e11d48', fontSize: '0.9rem' }}>{refSearchError}</div>
+                )}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '8px' }}>
+                  <button
+                    type="button"
+                    onClick={handleRefSearchClose}
+                    style={{ padding: '10px 16px', borderRadius: '999px', border: '1px solid var(--border-color)', backgroundColor: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer' }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={refSearching}
+                    style={{ padding: '10px 16px', borderRadius: '999px', border: 'none', backgroundColor: 'var(--accent)', color: '#fff', cursor: 'pointer' }}
+                  >
+                    {refSearching ? 'Searching...' : 'Find Contact'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
 
-        <main style={{ padding: '24px', flex: 1 }}>
+        <main style={{ padding: '24px', flex: 1, position: 'relative' }}>
+          {/* User filter loading overlay */}
+          {userFilterLoading && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                backgroundColor: 'rgba(0,0,0,0.35)',
+                backdropFilter: 'blur(4px)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 40,
+                borderRadius: '12px',
+                margin: '24px',
+              }}
+            >
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                padding: '32px 48px',
+                borderRadius: '20px',
+                boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '16px',
+              }}>
+                <Loader label="Loading user data..." />
+                <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+                  Fetching pipelines and contacts
+                </div>
+              </div>
+            </div>
+          )}
           <div
             style={{
               backgroundColor: 'var(--bg-card)',
@@ -627,7 +990,9 @@ export default function Crm() {
                     ? 'Track all leads and contacts with generated metadata and status updates.'
                     : activeTab === 'Leads'
                     ? 'Manage leads through your pipeline stages.'
-                    : 'Review clients, accounts, and relationship history.'}
+                    : activeTab === 'Clients'
+                    ? 'Review clients, accounts, and relationship history.'
+                    : 'View and restore deleted contacts. They can be restored to their last state.'}
                 </p>
               </div>
               {activeTab === 'Contacts' && (
@@ -648,6 +1013,28 @@ export default function Crm() {
                 >
                   <FaPlus />
                   Add new contact
+                </button>
+              )}
+              {activeTab === 'Deleted' && (
+                <button
+                  onClick={() => {
+                    setActiveTab('Contacts')
+                    fetchContacts()
+                  }}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '12px 18px',
+                    backgroundColor: 'transparent',
+                    color: 'var(--accent)',
+                    borderRadius: '999px',
+                    border: '1px solid var(--accent)',
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  ← Back to Contacts
                 </button>
               )}
               {activeTab === 'Leads' && (
@@ -810,13 +1197,14 @@ export default function Crm() {
                     </tr>
                   </thead>
                   <tbody>
-                    {loading ? (
+                    {contactsLoading ? (
                       <tr>
                         <td colSpan={9} style={{ padding: '24px 12px', textAlign: 'center' }}>
                           <Loader label="Loading contacts..." />
                         </td>
                       </tr>
                     ) : error ? (
+
                       <tr>
                         <td colSpan={9} style={{ padding: '24px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
                           {error}
@@ -831,13 +1219,18 @@ export default function Crm() {
                     ) : (
                       displayedContacts.map(contact => (
                         <tr key={contact.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                          <td style={{ padding: '14px 12px' }}>{contact.company_name || '—'}</td>
                           <td style={{ padding: '14px 12px' }}>
-                            <div style={{ fontWeight: 600 }}>{contact.name}</div>
+                            <div style={{ fontWeight: 600 }}>
+                              <Link to={`/crm/contact/${contact.reference_id || contact.id}`} style={{ color: 'inherit', textDecoration: 'none' }}>
+                                {contact.name}
+                              </Link>
+                            </div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Ref: {contact.reference_id || contact.id}</div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.company_name || '—'}</div>
                           </td>
                           <td style={{ padding: '14px 12px' }}>
-                            <div style={{ marginBottom: '4px' }}>{contact.email}</div>
-                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.phone}</div>
+                            <div style={{ marginBottom: '4px' }}>{contact.email || '—'}</div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.phone || '—'}</div>
                           </td>
                           <td style={{ padding: '14px 12px', maxWidth: '260px', color: 'var(--text-secondary)' }}>{contact.description}</td>
                           <td style={{ padding: '14px 12px' }}>
@@ -856,37 +1249,57 @@ export default function Crm() {
                           </td>
                           <td style={{ padding: '14px 12px' }}>{contact.stage}</td>
                           <td style={{ padding: '14px 12px' }}>{contact.owner}</td>
-                          <td style={{ padding: '14px 12px' }}>{contact.created_at ? new Date(contact.created_at).toLocaleDateString() : '—'}</td>
-                          <td style={{ padding: '14px 12px' }}>{contact.updated_at ? new Date(contact.updated_at).toLocaleDateString() : '—'}</td>
+                          <td style={{ padding: '14px 12px' }}>{formatDate(contact.created_at)}</td>
+                          <td style={{ padding: '14px 12px' }}>{formatDate(contact.updated_at)}</td>
                           <td style={{ padding: '14px 12px' }}>
-                            {activeTab === 'Contacts' ? (
-                              contact.pipeline_id != null ? (
-                                <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>In pipeline</span>
-                              ) : (
-                                <button
-                                  onClick={() => handleOpenMoveToLeadModal(contact)}
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: '6px',
-                                    padding: '8px 12px',
-                                    borderRadius: '999px',
-                                    border: '1px solid var(--accent)',
-                                    backgroundColor: 'transparent',
-                                    color: 'var(--accent)',
-                                    cursor: 'pointer',
-                                    fontSize: '0.85rem',
-                                  }}
-                                >
-                                  <FaArrowRight style={{ fontSize: '0.75rem' }} />
-                                  Move to leads
-                                </button>
-                              )
-                            ) : activeTab === 'Leads' ? (
-                              <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Lead</span>
-                            ) : (
-                              <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>—</span>
-                            )}
+                            <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                              {activeTab === 'Contacts' ? (
+                                contact.pipeline_id != null ? (
+                                  <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>In pipeline</span>
+                                ) : (
+                                  <button
+                                    onClick={() => handleOpenMoveToLeadModal(contact)}
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '6px',
+                                      padding: '8px 12px',
+                                      borderRadius: '999px',
+                                      border: '1px solid var(--accent)',
+                                      backgroundColor: 'transparent',
+                                      color: 'var(--accent)',
+                                      cursor: 'pointer',
+                                      fontSize: '0.85rem',
+                                    }}
+                                  >
+                                    <FaArrowRight style={{ fontSize: '0.75rem' }} />
+                                    Move to leads
+                                  </button>
+                                )
+                              ) : activeTab === 'Leads' ? (
+                                <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Lead</span>
+                              ) : null}
+                              <button
+                                onClick={() => handleDeleteContact(contact.id)}
+                                disabled={deletingContactId === contact.id}
+                                title="Delete contact"
+                                style={{
+                                  padding: '6px 12px',
+                                  borderRadius: '999px',
+                                  border: '1px solid #ef4444',
+                                  backgroundColor: 'transparent',
+                                  color: '#ef4444',
+                                  cursor: deletingContactId === contact.id ? 'wait' : 'pointer',
+                                  fontSize: '0.8rem',
+                                  fontWeight: 600,
+                                  opacity: deletingContactId === contact.id ? 0.6 : 1,
+                                }}
+                                onMouseEnter={e => { e.currentTarget.style.backgroundColor = 'rgba(239,68,68,0.08)' }}
+                                onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'transparent' }}
+                              >
+                                {deletingContactId === contact.id ? '...' : 'Delete'}
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))
@@ -924,9 +1337,10 @@ export default function Crm() {
                       }}
                     >
                       {kanbanPhases.map((phase, phaseIndex) => {
-                        const phaseLeads = leadContacts.filter(contact => getLeadPhaseIndex(contact) === phaseIndex)
+                        const phaseLeads = leadsByPhaseIndex[phaseIndex] || []
 
                         return (
+
                           <div
                             key={phase.id}
                             onDragOver={event => event.preventDefault()}
@@ -1032,6 +1446,85 @@ export default function Crm() {
                       })}
                     </div>
 
+                    {unassignedLeads.length > 0 && (
+                      <div style={{ marginTop: '24px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                          <div>
+                            <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Unassigned leads</h3>
+                            <p style={{ margin: '4px 0 0', color: 'var(--text-secondary)', fontSize: '0.95rem' }}>
+                              Leads without a pipeline assignment remain here until they are moved into one.
+                            </p>
+                          </div>
+                          <span style={{ color: 'var(--text-secondary)', fontSize: '0.95rem' }}>{unassignedLeads.length} lead{unassignedLeads.length === 1 ? '' : 's'}</span>
+                        </div>
+                        <div style={{ display: 'grid', gap: '12px' }}>
+                          {unassignedLeads.map(contact => (
+                            <div
+                              key={contact.id}
+                              style={{
+                                backgroundColor: 'var(--bg-card)',
+                                border: '1px solid var(--border-color)',
+                                borderRadius: '14px',
+                                padding: '16px',
+                                display: 'grid',
+                                gap: '8px',
+                              }}
+                            >
+                              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'flex-start' }}>
+                                <div style={{ flex: 1, cursor: 'pointer' }} onClick={() => handleOpenLeadDetail(contact)}>
+                                  <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{contact.name}</div>
+                                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.company_name || 'No company'}</div>
+                                </div>
+                                <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', flexShrink: 0 }}>
+                                  {contact.status}
+                                </span>
+                              </div>
+                              <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.email}</div>
+                              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '4px' }}>
+                                <select
+                                  value={assigningPipelineId[contact.id] || ''}
+                                  onChange={e => setAssigningPipelineId(prev => ({ ...prev, [contact.id]: Number(e.target.value) }))}
+                                  style={{
+                                    flex: 1,
+                                    padding: '8px 12px',
+                                    borderRadius: '8px',
+                                    border: '1px solid var(--border-color)',
+                                    backgroundColor: 'var(--bg-secondary)',
+                                    color: 'var(--text-primary)',
+                                    fontSize: '0.8rem',
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  <option value="">Select pipeline...</option>
+                                  {pipelines.map(p => (
+                                    <option key={p.id} value={p.id}>{p.name}</option>
+                                  ))}
+                                </select>
+                                <button
+                                  onClick={() => handleAssignToPipeline(contact.id, assigningPipelineId[contact.id])}
+                                  disabled={!assigningPipelineId[contact.id] || assigningLeadId === contact.id}
+                                  style={{
+                                    padding: '8px 16px',
+                                    borderRadius: '8px',
+                                    border: 'none',
+                                    backgroundColor: 'var(--accent)',
+                                    color: '#fff',
+                                    cursor: (!assigningPipelineId[contact.id] || assigningLeadId === contact.id) ? 'not-allowed' : 'pointer',
+                                    fontSize: '0.8rem',
+                                    fontWeight: 600,
+                                    opacity: (!assigningPipelineId[contact.id] || assigningLeadId === contact.id) ? 0.6 : 1,
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                >
+                                  {assigningLeadId === contact.id ? '...' : 'Assign'}
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     <PipelineManager
                       pipelines={pipelines}
                       settingsOpenExternal={pipelineSettingsOpen}
@@ -1083,10 +1576,17 @@ export default function Crm() {
                     ) : (
                       displayedContacts.map(contact => (
                         <tr key={contact.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                          <td style={{ padding: '14px 12px', fontWeight: 600 }}>{contact.name}</td>
                           <td style={{ padding: '14px 12px' }}>
-                            <div style={{ marginBottom: '4px' }}>{contact.email}</div>
-                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.phone}</div>
+                            <div style={{ fontWeight: 600 }}>
+                              <Link to={`/crm/contact/${contact.reference_id || contact.id}`} style={{ color: 'inherit', textDecoration: 'none' }}>
+                                {contact.name}
+                              </Link>
+                            </div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Ref: {contact.reference_id || contact.id}</div>
+                          </td>
+                          <td style={{ padding: '14px 12px' }}>
+                            <div style={{ marginBottom: '4px' }}>{contact.email || '—'}</div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.phone || '—'}</div>
                           </td>
                           <td style={{ padding: '14px 12px' }}>{contact.company_name || '—'}</td>
                           <td style={{ padding: '14px 12px' }}>
@@ -1104,7 +1604,97 @@ export default function Crm() {
                             </span>
                           </td>
                           <td style={{ padding: '14px 12px' }}>{contact.stage}</td>
-                          <td style={{ padding: '14px 12px' }}>{contact.created_at ? new Date(contact.created_at).toLocaleDateString() : '—'}</td>
+                          <td style={{ padding: '14px 12px' }}>{formatDate(contact.created_at)}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {activeTab === 'Deleted' && (
+              <div style={{ marginTop: '24px', overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '920px' }}>
+                  <thead>
+                    <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--border-color)' }}>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Name</th>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Email / Phone</th>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Status Before</th>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Stage Before</th>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Owner</th>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Deleted</th>
+                      <th style={{ padding: '14px 12px', color: 'var(--text-secondary)' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {contactsLoading ? (
+                      <tr>
+                        <td colSpan={7} style={{ padding: '24px 12px', textAlign: 'center' }}>
+                          <Loader label="Loading deleted contacts..." />
+                        </td>
+                      </tr>
+                    ) : displayedContacts.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ padding: '24px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                          No deleted contacts. Deleted contacts will appear here where you can restore them.
+                        </td>
+                      </tr>
+                    ) : (
+                      displayedContacts.map(contact => (
+                        <tr key={contact.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
+                          <td style={{ padding: '14px 12px' }}>
+                            <div style={{ fontWeight: 600 }}>
+                              <Link to={`/crm/contact/${contact.reference_id || contact.id}`} style={{ color: 'inherit', textDecoration: 'none' }}>
+                                {contact.name}
+                              </Link>
+                            </div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Ref: {contact.reference_id || contact.id}</div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.company_name || '—'}</div>
+                          </td>
+                          <td style={{ padding: '14px 12px' }}>
+                            <div style={{ marginBottom: '4px' }}>{contact.email || '—'}</div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{contact.phone || '—'}</div>
+                          </td>
+                          <td style={{ padding: '14px 12px' }}>
+                            <span style={{
+                              padding: '4px 10px',
+                              borderRadius: '999px',
+                              fontSize: '0.8rem',
+                              fontWeight: 600,
+                              backgroundColor: contact.status === 'Active' ? 'rgba(16,185,129,0.12)' : contact.status === 'Contacted' ? 'rgba(59,130,246,0.12)' : 'rgba(234,179,8,0.12)',
+                              color: contact.status === 'Active' ? '#047857' : contact.status === 'Contacted' ? '#1d4ed8' : '#92400e',
+                            }}>
+                              {contact.status}
+                            </span>
+                          </td>
+                          <td style={{ padding: '14px 12px' }}>{contact.stage}</td>
+                          <td style={{ padding: '14px 12px' }}>{contact.owner}</td>
+                          <td style={{ padding: '14px 12px', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+                            {formatDate(contact.updated_at)}
+                          </td>
+                          <td style={{ padding: '14px 12px' }}>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                              <button
+                                onClick={() => handleRestoreContact(contact.id)}
+                                disabled={restoringContactId === contact.id}
+                                style={{
+                                  padding: '8px 14px',
+                                  borderRadius: '999px',
+                                  border: '1px solid #10b981',
+                                  backgroundColor: 'transparent',
+                                  color: '#10b981',
+                                  cursor: restoringContactId === contact.id ? 'wait' : 'pointer',
+                                  fontSize: '0.8rem',
+                                  fontWeight: 600,
+                                  opacity: restoringContactId === contact.id ? 0.6 : 1,
+                                }}
+                                onMouseEnter={e => { e.currentTarget.style.backgroundColor = 'rgba(16,185,129,0.1)' }}
+                                onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'transparent' }}
+                              >
+                                {restoringContactId === contact.id ? '...' : 'Restore'}
+                              </button>
+                            </div>
+                          </td>
                         </tr>
                       ))
                     )}
@@ -1314,7 +1904,8 @@ export default function Crm() {
                                 color: 'var(--text-primary)',
                               }}
                             >
-                              {pipelines.length === 0 && <option value="">No pipelines available</option>}
+                              <option value="">No pipeline</option>
+                              {pipelines.length === 0 && <option value="" disabled>No pipelines available</option>}
                               {pipelines.map(pipeline => (
                                 <option key={pipeline.id} value={pipeline.id}>
                                   {pipeline.name}
@@ -1687,19 +2278,36 @@ export default function Crm() {
                       View and edit lead information.
                     </p>
                   </div>
-                  <button
-                    onClick={handleCloseLeadDetail}
-                    style={{
-                      border: 'none',
-                      background: 'transparent',
-                      color: 'var(--text-secondary)',
-                      cursor: 'pointer',
-                      fontSize: '1.1rem',
-                      padding: '6px',
-                    }}
-                  >
-                    ×
-                  </button>
+                  <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                    <a
+                      href={`/crm/contact/${selectedLeadContact.reference_id || selectedLeadContact.id}`}
+                      style={{
+                        padding: '10px 14px',
+                        borderRadius: '999px',
+                        border: '1px solid var(--border-color)',
+                        backgroundColor: 'transparent',
+                        color: 'var(--accent)',
+                        textDecoration: 'none',
+                        fontSize: '0.9rem',
+                        fontWeight: 600,
+                      }}
+                    >
+                      Track Contact
+                    </a>
+                    <button
+                      onClick={handleCloseLeadDetail}
+                      style={{
+                        border: 'none',
+                        background: 'transparent',
+                        color: 'var(--text-secondary)',
+                        cursor: 'pointer',
+                        fontSize: '1.1rem',
+                        padding: '6px',
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
                 </div>
                 <form onSubmit={handleUpdateLead} style={{ display: 'grid', gap: '14px' }}>
                   <div style={{ display: 'grid', gap: '12px' }}>

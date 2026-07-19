@@ -20,7 +20,7 @@ const hrTabs = [
 
 const leaveTypes = ['Sick', 'Casual', 'Annual', 'Personal', 'Maternity', 'Paternity']
 const attendanceStatuses = ['Present', 'Absent', 'Late', 'Half Day']
-const employeeStatuses = ['Active', 'Inactive', 'On Leave', 'Terminated']
+const employeeStatuses = ['Active', 'Inactive', 'On Leave', 'Resigned', 'Terminated']
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController()
@@ -80,6 +80,8 @@ export default function Hr() {
   // Filters
   const [leaveFilter, setLeaveFilter] = useState('')
   const [attendanceFilter, setAttendanceFilter] = useState('')
+  const [employeeStatusFilter, setEmployeeStatusFilter] = useState('Active') // 'Active' = active only, '' = all
+  const [togglingUserId, setTogglingUserId] = useState(null)
 
   // ─── Data Fetching ─────────────────────────────────────────────────────────
 
@@ -95,9 +97,11 @@ export default function Hr() {
     }
   }
 
-  async function fetchEmployees() {
+  async function fetchEmployees(statusFilter) {
     try {
-      const res = await fetchWithTimeout(`${API}/hr/employees`, { headers: getAuthHeaders() })
+      const filter = statusFilter !== undefined ? statusFilter : employeeStatusFilter
+      const url = filter ? `${API}/hr/employees?status=${encodeURIComponent(filter)}` : `${API}/hr/employees?status=`
+      const res = await fetchWithTimeout(url, { headers: getAuthHeaders() })
       if (res.ok) {
         const data = await res.json()
         setEmployees(data)
@@ -482,6 +486,33 @@ export default function Hr() {
     }
   }
 
+  async function handleToggleUserActive(userId, currentActive) {
+    setTogglingUserId(userId)
+    try {
+      const res = await fetch(`${API}/hr/users/${userId}`, {
+        method: 'PATCH',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ is_active: !currentActive }),
+      })
+      if (!res.ok) {
+        const errData = await res.json().catch(() => null)
+        throw new Error(errData?.detail || 'Failed to toggle user status')
+      }
+      await fetchHrUsers()
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('success', 'Success', `User ${currentActive ? 'deactivated' : 'activated'} successfully.`),
+      })
+    } catch (err) {
+      dispatchNotifications({
+        type: 'ADD',
+        payload: createNotification('error', 'Error', err.message),
+      })
+    } finally {
+      setTogglingUserId(null)
+    }
+  }
+
   // ─── Computed ──────────────────────────────────────────────────────────────
 
   const departmentMap = useMemo(() => {
@@ -522,6 +553,7 @@ export default function Hr() {
       'Inactive': { bg: 'rgba(156, 163, 175, 0.12)', color: '#6b7280' },
       'On Leave': { bg: 'rgba(234, 179, 8, 0.12)', color: '#92400e' },
       'Terminated': { bg: 'rgba(239, 68, 68, 0.12)', color: '#b91c1c' },
+      'Resigned': { bg: 'rgba(156, 163, 175, 0.18)', color: '#4b5563' },
       'Present': { bg: 'rgba(34, 197, 94, 0.12)', color: '#15803d' },
       'Absent': { bg: 'rgba(239, 68, 68, 0.12)', color: '#b91c1c' },
       'Late': { bg: 'rgba(234, 179, 8, 0.12)', color: '#92400e' },
@@ -949,18 +981,40 @@ export default function Hr() {
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '10px' }}>
           <div style={{ position: 'relative', maxWidth: '320px', flex: 1 }}>
-            <FaSearch style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)', fontSize: '0.8rem', pointerEvents: 'none' }} />
-            <input
-              value={search} onChange={e => setSearch(e.target.value)}
-              placeholder="Search employees..."
-              onFocus={() => setSearchFocused(true)} onBlur={() => setSearchFocused(false)}
-              style={{
-                width: '100%', padding: '8px 12px 8px 32px', borderRadius: '8px',
-                border: '1px solid ' + (searchFocused ? 'var(--accent)' : 'var(--border-color)'),
-                backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '0.85rem', outline: 'none',
-                boxShadow: searchFocused ? '0 0 0 3px rgba(0,149,246,0.15)' : 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxSizing: 'border-box',
-              }}
-            />
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <div style={{ position: 'relative', maxWidth: '240px' }}>
+                <FaSearch style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)', fontSize: '0.8rem', pointerEvents: 'none' }} />
+                <input
+                  value={search} onChange={e => setSearch(e.target.value)}
+                  placeholder="Search employees..."
+                  onFocus={() => setSearchFocused(true)} onBlur={() => setSearchFocused(false)}
+                  style={{
+                    width: '100%', padding: '8px 12px 8px 32px', borderRadius: '8px',
+                    border: '1px solid ' + (searchFocused ? 'var(--accent)' : 'var(--border-color)'),
+                    backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '0.85rem', outline: 'none',
+                    boxShadow: searchFocused ? '0 0 0 3px rgba(0,149,246,0.15)' : 'none', transition: 'border-color 0.2s, box-shadow 0.2s', boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+              <select
+                value={employeeStatusFilter}
+                onChange={e => {
+                  const val = e.target.value
+                  setEmployeeStatusFilter(val)
+                  fetchEmployees(val)
+                }}
+                style={{
+                  padding: '8px 12px', borderRadius: '8px', border: '1px solid var(--border-color)',
+                  backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '0.85rem', outline: 'none',
+                }}
+              >
+                <option value="Active">Active only</option>
+                <option value="">All employees</option>
+                {employeeStatuses.filter(s => s !== 'Active').map(s => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <button onClick={() => openCreateModal('employee')} style={{
             display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '10px 18px',
@@ -1316,6 +1370,18 @@ export default function Hr() {
                     <td style={{ padding: '12px' }}>{renderStatusBadge(user.is_active ? 'Active' : 'Inactive')}</td>
                     <td style={{ padding: '12px' }}>
                       <div style={{ display: 'flex', gap: '6px' }}>
+                        <button
+                          onClick={() => handleToggleUserActive(user.id, user.is_active)}
+                          disabled={togglingUserId === user.id}
+                          style={{
+                            background: 'none', border: 'none',
+                            color: togglingUserId === user.id ? 'var(--text-secondary)' : (user.is_active ? '#f59e0b' : '#22c55e'),
+                            cursor: togglingUserId === user.id ? 'wait' : 'pointer', padding: '4px', opacity: togglingUserId === user.id ? 0.5 : 1,
+                          }}
+                          title={user.is_active ? 'Deactivate user' : 'Activate user'}
+                        >
+                          {togglingUserId === user.id ? <FaClock /> : (user.is_active ? <FaBan /> : <FaCheckCircle />)}
+                        </button>
                         <button onClick={() => openEditUserModal(user)} style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', padding: '4px' }} title="Edit credentials">
                           <FaEdit />
                         </button>
