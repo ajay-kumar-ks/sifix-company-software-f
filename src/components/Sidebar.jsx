@@ -124,11 +124,13 @@ export default function Sidebar() {
         backgroundColor: 'var(--bg-card)',
         borderRight: '1px solid var(--border-color)',
         width: collapsed ? '64px' : '220px',
-        minHeight: '100vh',
+        height: '100vh',
         display: 'flex',
         flexDirection: 'column',
         transition: 'width 0.25s ease',
         flexShrink: 0,
+        position: 'sticky',
+        top: 0,
       }}
     >
       {/* Brand — click to collapse/expand */}
@@ -163,8 +165,8 @@ export default function Sidebar() {
 
       </div>
 
-      {/* Nav items */}
-      <nav style={{ flex: 1, padding: '12px 0', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+      {/* Nav items — scrollable if content overflows */}
+      <nav style={{ flex: 1, padding: '12px 0', display: 'flex', flexDirection: 'column', gap: '2px', overflowY: 'auto', minHeight: 0 }}>
         {menuItems.map(item => (
           <NavLink key={item.path} to={item.path} end>
             {({ isActive }) => (
